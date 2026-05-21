@@ -104,55 +104,78 @@ def calculate_risk_score(bankruptcy_prob, var_percent, margin_ratio, roi):
     return min(100, max(0, (base_risk * 0.85) + (roi_risk * 0.15)))
 
 # ==============================================================================
-# 3. ИСПРАВЛЕННОЕ ЯДРО МОНТЕ-КАРЛО (РЕАЛИСТИЧНЫЕ ROI)
+# 3. ИСПРАВЛЕННОЕ ЯДРО МОНТЕ-КАРЛО (ВСЕ 5 БАГОВ ПОФИКШЕНЫ)
 # ==============================================================================
 @st.cache_data(ttl=3600)
 def run_monte_carlo_institutional(data_dict, scenario, num_simulations=1000, months=12, demand_multiplier=1.0):
     """
     ИСПРАВЛЕННАЯ версия Монте-Карло:
-    - Реалистичный расчёт капитала (начальный баланс = капитал, НЕ -капитал)
-    - Правильный ROI: (конечный_капитал - начальный) / начальный
+    - Баг #1: start_sales отталкивается от точки безубыточности (150% от BEP)
+    - Баг #2: drift = 0.002 (0.2% в месяц = 2.4% годовых — реалистично)
+    - Баг #3: волатильность спроса снижена (макс 12% в месяц)
+    - Баг #4: competition влияет на волатильность и маржу
+    - Баг #5: добавлен потолок роста спроса (макс 200% от стартового)
     """
     price = data_dict['price']
     var_cost = data_dict['variable_cost']
     fixed = data_dict['fixed_expenses']
     capital = data_dict['start_capital']
     industry = data_dict['industry']
+    competition = data_dict['competition']
     
     margin_per_unit = price - var_cost
     
-    # Защита от нереалистичной маржи (не более 70% от цены)
-    max_reasonable_margin = price * 0.7
-    if margin_per_unit > max_reasonable_margin:
-        margin_per_unit = max_reasonable_margin
-    
-    INDUSTRY_VOLATILITY = {
-        'Технологии': [0.35, 0.15, 0.10],   
-        'Ритейл': [0.18, 0.10, 0.05],
-        'Производство': [0.12, 0.25, 0.08], 
-        'Услуги': [0.22, 0.08, 0.04]
+    # БАГ #4: Конкуренция влияет на параметры
+    competition_multipliers = {
+        'Низкая': {'margin_factor': 1.0, 'volatility_factor': 0.8, 'demand_cap_factor': 2.0},
+        'Средняя': {'margin_factor': 0.85, 'volatility_factor': 1.0, 'demand_cap_factor': 1.5},
+        'Высокая': {'margin_factor': 0.7, 'volatility_factor': 1.3, 'demand_cap_factor': 1.2}
     }
-    vols = INDUSTRY_VOLATILITY.get(industry, [0.25, 0.15, 0.10])
+    comp_mult = competition_multipliers.get(competition, competition_multipliers['Средняя'])
+    margin_per_unit *= comp_mult['margin_factor']
     
-    # Реалистичный базовый спрос (ограниченный)
-    industry_base = {'Технологии': 150, 'Ритейл': 300, 'Производство': 100, 'Услуги': 200}
-    start_sales = industry_base.get(industry, 200) * demand_multiplier
-    # Ограничиваем максимальный спрос (реалистично)
-    start_sales = min(start_sales, 1000)
-
-    drift = 0.03  
+    # Базовая волатильность по отраслям (СНИЖЕНА — БАГ #3)
+    INDUSTRY_VOLATILITY = {
+        'Технологии': [0.12, 0.10, 0.08],   # было 0.35, 0.15, 0.10
+        'Ритейл': [0.08, 0.07, 0.04],       # было 0.18, 0.10, 0.05
+        'Производство': [0.06, 0.12, 0.06], # было 0.12, 0.25, 0.08
+        'Услуги': [0.07, 0.06, 0.03]        # было 0.22, 0.08, 0.04
+    }
+    vols = INDUSTRY_VOLATILITY.get(industry, [0.08, 0.08, 0.06])
+    # Применяем фактор конкуренции к волатильности
+    vols = [v * comp_mult['volatility_factor'] for v in vols]
+    
+    # Точка безубыточности в единицах
+    break_even_units = fixed / margin_per_unit if margin_per_unit > 0 else float('inf')
+    
+    # БАГ #1: Стартовые продажи = 150% от точки безубыточности (реалистичный старт)
+    if break_even_units != float('inf') and break_even_units > 0:
+        base_sales = break_even_units * 1.5
+    else:
+        base_sales = 100  # fallback
+    
+    # Ограничиваем стартовые продажи разумным диапазоном
+    base_sales = max(20, min(base_sales, 5000))
+    
+    start_sales = base_sales * demand_multiplier
+    
+    # БАГ #2: drift = 0.002 (0.2% в месяц = 2.4% годовых — реально)
+    drift = 0.002
     if scenario == "Кризис 2026":
-        margin_per_unit *= 0.7
-        start_sales *= 0.75
-        drift = -0.02
+        margin_per_unit *= 0.8
+        start_sales *= 0.8
+        drift = -0.01  # -1% в месяц в кризис
     elif scenario == "Агрессивный рост":
-        margin_per_unit *= 1.1  # Снижено с 1.15 для реалистичности
-        start_sales *= 1.1     # Снижено с 1.2
-        drift = 0.05           # Снижено с 0.06
-
+        margin_per_unit *= 1.05
+        start_sales *= 1.1
+        drift = 0.005  # 0.5% в месяц = 6% годовых
+    
+    # БАГ #5: Потолок роста спроса
+    max_sales_cap = start_sales * comp_mult['demand_cap_factor']
+    
     corr_matrix = np.array([
-        [1.0, -0.4],
-        [-0.4, 1.0]
+        [1.0, -0.3],
+        [-0.3, 1.0]
     ])
     cov_matrix = np.diag([vols[1], vols[2]]) @ corr_matrix @ np.diag([vols[1], vols[2]])
 
@@ -163,7 +186,7 @@ def run_monte_carlo_institutional(data_dict, scenario, num_simulations=1000, mon
     ruin_by_month = np.zeros(months)
 
     for _ in range(num_simulations):
-        # ИСПРАВЛЕНО: Начальный баланс = capital (НЕ -capital)
+        # ИСПРАВЛЕНО: начальный баланс = капитал (не -капитал)
         balance = capital
         path = []
         is_bankrupt = False
@@ -180,15 +203,16 @@ def run_monte_carlo_institutional(data_dict, scenario, num_simulations=1000, mon
             vol_demand = vols[0]
             rand_normal = np.random.normal()
             current_sales *= np.exp((drift - 0.5 * vol_demand**2) + vol_demand * rand_normal)
+            
+            # БАГ #5: Применяем потолок спроса
+            current_sales = min(current_sales, max_sales_cap)
             sim_sales = max(5, int(current_sales))
-            # Ограничиваем продажи реалистичным потолком
-            sim_sales = min(sim_sales, 2000)
             
             cost_shock = shocks[m-1, 0]
             price_shock = shocks[m-1, 1]
             
             sim_margin = margin_per_unit * (1 + price_shock - cost_shock)
-            sim_margin = np.clip(sim_margin, margin_per_unit * 0.5, margin_per_unit * 1.5)
+            sim_margin = np.clip(sim_margin, margin_per_unit * 0.7, margin_per_unit * 1.3)
             
             monthly_cf = (sim_sales * sim_margin) - fixed
             balance += monthly_cf
@@ -206,7 +230,6 @@ def run_monte_carlo_institutional(data_dict, scenario, num_simulations=1000, mon
         all_paths.append(path)
         final_balances.append(balance)
     
-    # ИСПРАВЛЕНО: Правильный расчёт убытков
     final_balances_np = np.array(final_balances)
     losses = capital - final_balances_np  
     
@@ -239,31 +262,24 @@ def generate_forecast_metrics(data, scenario, demand_multiplier=1.0, fast_mode=F
         data_dict, scenario, num_simulations=sim_count, demand_multiplier=demand_multiplier
     )
     
-    # ИСПРАВЛЕНО: Правильный расчёт ROI
     capital = data['start_capital']
     avg_final_balance = np.mean(mc_results['final_balances'])
     net_profit = avg_final_balance - capital
     roi = (net_profit / capital) * 100 if capital > 0 else 0
-    # Ограничиваем ROI реалистичным значением (макс 300%)
-    roi = min(roi, 300)
     
     rf_rate = 6.0
     final_balances_np = np.array(mc_results['final_balances'])
     all_sim_rois = ((final_balances_np - capital) / capital) * 100
-    all_sim_rois = np.clip(all_sim_rois, -100, 300)
     
     total_std = np.std(all_sim_rois)
     sharpe_ratio = (roi - rf_rate) / total_std if total_std > 0 else 0
-    sharpe_ratio = max(-2, min(5, sharpe_ratio))
     
     downside_returns = all_sim_rois[all_sim_rois < rf_rate]
     if len(downside_returns) > 0:
         downside_deviation = np.sqrt(np.mean((downside_returns - rf_rate) ** 2))
         sortino_ratio = (roi - rf_rate) / downside_deviation if downside_deviation > 0 else 0
     else:
-        sortino_ratio = 9.99
-    
-    sortino_ratio = max(-2, min(10, sortino_ratio))
+        sortino_ratio = 5.0
     
     risk_score = calculate_risk_score(
         mc_results['bankruptcy_prob'], mc_results['var_percent'], margin_ratio, roi
@@ -518,5 +534,4 @@ with tab_monte:
             label="95% Expected Shortfall (ES / CVaR)", 
             value=f"{mc_res['expected_shortfall']:.2f} сомони"
         )
-
-
+        
